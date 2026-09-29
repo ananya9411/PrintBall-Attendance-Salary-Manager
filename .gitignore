@@ -62,3 +62,6 @@ electron-builder.yaml
 # Supabase local files
 supabase/.temp/
 supabase/.branches/
+
+# Lovable
+.lovable/
