@@ -1,0 +1,348 @@
+from __future__ import annotations
+
+import time
+from collections import defaultdict, deque
+from datetime import datetime, timezone
+from typing import Annotated
+from urllib import error as urlerror
+from urllib import request as urlrequest
+import json
+
+import cv2
+import numpy as np
+from deepface import DeepFace
+from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic_settings import BaseSettings, SettingsConfigDict
+from supabase import Client, create_client
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    supabase_url: str
+    supabase_service_role_key: str
+    cors_origins: str = "http://localhost:8080"
+    max_upload_bytes: int = 8_000_000
+    rate_limit_attempts: int = 8
+    rate_limit_window_seconds: int = 300
+
+
+settings = Settings()
+supabase: Client = create_client(settings.supabase_url, settings.supabase_service_role_key)
+app = FastAPI(title="PrintBall Attendance Security API", version="1.1.0")
+
+
+@app.on_event("startup")
+async def warm_face_model() -> None:
+    # Load the identity model once when the security API starts. Without this
+    # warm-up, the first employee capture pays the model-load/download cost.
+    try:
+        DeepFace.build_model("Facenet512")
+        print("[attendance] Facenet512 model ready")
+    except Exception as exc:
+        # Do not prevent the API from starting; the first verification can retry.
+        print(f"[attendance] face model warm-up deferred: {type(exc).__name__}: {exc}")
+
+
+origins = [item.strip() for item in settings.cors_origins.split(",") if item.strip()]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins or ["*"],
+    allow_credentials=True,
+    allow_methods=["POST", "GET"],
+    allow_headers=["Authorization", "Content-Type"],
+)
+
+_attempts: dict[str, deque[float]] = defaultdict(deque)
+
+
+def enforce_rate_limit(key: str) -> None:
+    now = time.time()
+    bucket = _attempts[key]
+    while bucket and now - bucket[0] > settings.rate_limit_window_seconds:
+        bucket.popleft()
+    if len(bucket) >= settings.rate_limit_attempts:
+        raise HTTPException(status_code=429, detail="Too many verification attempts. Please wait and try again.")
+    bucket.append(now)
+
+
+def decode_image(data: bytes) -> np.ndarray:
+    if not data or len(data) > settings.max_upload_bytes:
+        raise HTTPException(status_code=413, detail="Image is empty or too large.")
+    image = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+    if image is None:
+        raise HTTPException(status_code=400, detail="The uploaded image could not be decoded.")
+    return image
+
+
+def download_profile(employee_id: str) -> bytes:
+    employee = (
+        supabase.table("employees")
+        .select("id,photo_path,active")
+        .eq("id", employee_id)
+        .limit(1)
+        .execute()
+    ).data or []
+    employee = employee[0] if isinstance(employee, list) and employee else employee
+    if not employee or not employee.get("active"):
+        raise HTTPException(status_code=404, detail="Employee not found or inactive.")
+    path = employee.get("photo_path")
+    if not path:
+        raise HTTPException(status_code=400, detail="This employee does not have a profile photo. A profile photo is required for secure attendance.")
+    try:
+        return supabase.storage.from_("employee-photos").download(path)
+    except Exception as exc:
+        print(f"[attendance] profile download failed: {type(exc).__name__}: {exc}")
+        raise HTTPException(status_code=502, detail="Could not retrieve the employee profile photo.") from exc
+
+
+def extract_one_face(image: np.ndarray, *, label: str) -> np.ndarray:
+    """Detect exactly one face and return its aligned crop.
+
+    This endpoint receives the manually captured frontal photo after the active
+    browser liveness challenge. We deliberately do not run DeepFace's optional
+    anti-spoofing detector here: on ordinary laptop/phone webcams that detector
+    can reject valid captures before identity matching and was the source of the
+    generic 422 responses. The active challenge is the liveness gate; this server
+    step is responsible for face detection and identity verification.
+    """
+    errors: list[str] = []
+    for detector in ("retinaface", "opencv"):
+        try:
+            faces = DeepFace.extract_faces(
+                img_path=image,
+                detector_backend=detector,
+                enforce_detection=True,
+                align=True,
+                anti_spoofing=False,
+            )
+            if len(faces) != 1:
+                errors.append(f"{detector}: expected exactly 1 face, found {len(faces)}")
+                continue
+            crop = faces[0].get("face")
+            if crop is None or not isinstance(crop, np.ndarray) or crop.size == 0:
+                errors.append(f"{detector}: empty face crop")
+                continue
+            return crop
+        except Exception as exc:
+            errors.append(f"{detector}: {type(exc).__name__}: {exc}")
+
+    print(f"[attendance] {label} face extraction failed: {' | '.join(errors)}")
+    raise HTTPException(
+        status_code=422,
+        detail=(
+            "We could not detect exactly one clear face in the captured photo. "
+            "Face the camera, keep your whole face visible, and capture again."
+        ),
+    )
+
+
+def verify_identity(profile_bytes: bytes, live_bytes: bytes) -> tuple[bool, float | None]:
+    """One calibrated server-side identity comparison.
+
+    The browser has already completed the active liveness challenge. We therefore
+    avoid running a separate face-extraction pass and do exactly one DeepFace
+    comparison. The model is cached by DeepFace after its first request, so later
+    captures are substantially faster.
+    """
+    profile = decode_image(profile_bytes)
+    live = decode_image(live_bytes)
+    try:
+        result = DeepFace.verify(
+            img1_path=live,
+            img2_path=profile,
+            model_name="Facenet512",
+            detector_backend="opencv",
+            distance_metric="cosine",
+            enforce_detection=True,
+            align=True,
+            anti_spoofing=False,
+        )
+        verified = bool(result.get("verified"))
+        distance = result.get("distance")
+        distance_value = float(distance) if distance is not None else None
+        threshold = result.get("threshold")
+        print(f"[attendance] face verification: detector=opencv verified={verified} distance={distance_value} model_threshold={threshold}")
+        return verified, distance_value
+    except Exception as exc:
+        print(f"[attendance] face verification engine failed: {type(exc).__name__}: {exc}")
+        raise HTTPException(
+            status_code=422,
+            detail="We could not verify the captured face. Please face the camera and capture again.",
+        ) from exc
+
+
+def supabase_rest(method: str, table: str, *, query: str = "", payload: dict | None = None) -> list[dict]:
+    """Use Supabase REST directly for attendance writes.
+
+    This bypasses version-sensitive Python PostgREST response helpers (including
+    .single()) while retaining the service-role boundary on the backend.
+    """
+    url = f"{settings.supabase_url.rstrip('/')}/rest/v1/{table}{query}"
+    body = json.dumps(payload).encode("utf-8") if payload is not None else None
+    req = urlrequest.Request(url, data=body, method=method.upper())
+    req.add_header("apikey", settings.supabase_service_role_key)
+    req.add_header("Authorization", f"Bearer {settings.supabase_service_role_key}")
+    req.add_header("Content-Type", "application/json")
+    req.add_header("Accept", "application/json")
+    req.add_header("Prefer", "return=representation")
+    try:
+        with urlrequest.urlopen(req, timeout=8) as response:
+            raw = response.read().decode("utf-8")
+            if not raw:
+                return []
+            data = json.loads(raw)
+            return data if isinstance(data, list) else [data]
+    except urlerror.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Supabase REST {method} {table} failed ({exc.code}): {detail}") from exc
+    except Exception as exc:
+        raise RuntimeError(f"Supabase REST {method} {table} failed: {type(exc).__name__}: {exc}") from exc
+
+
+def upload_attendance_photo(employee_id: str, mode: str, data: bytes) -> str:
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    path = f"{employee_id}/{stamp}-{mode}.jpg"
+    try:
+        supabase.storage.from_("attendance-photos").upload(
+            path,
+            data,
+            {"content-type": "image/jpeg", "upsert": False},
+        )
+    except Exception as exc:
+        print(f"[attendance] photo upload failed: {type(exc).__name__}: {exc}")
+        raise HTTPException(status_code=502, detail="Attendance photo could not be stored.") from exc
+    return path
+
+
+def india_today() -> str:
+    from zoneinfo import ZoneInfo
+    return datetime.now(ZoneInfo("Asia/Kolkata")).date().isoformat()
+
+
+@app.get("/health")
+def health() -> dict[str, str]:
+    return {"status": "ok", "service": "printball-attendance-security"}
+
+
+@app.post("/api/attendance/check-in")
+async def check_in(
+    employee_id: Annotated[str, Form()],
+    challenge_passed: Annotated[str, Form()],
+    image: Annotated[UploadFile, File()],
+    authorization: str | None = Header(default=None),
+):
+    if challenge_passed.lower() != "true":
+        raise HTTPException(status_code=422, detail="Complete the liveness check before capturing your attendance photo.")
+    enforce_rate_limit(f"in:{employee_id}")
+    image_bytes = await image.read()
+    profile_bytes = download_profile(employee_id)
+    verified, distance = verify_identity(profile_bytes, image_bytes)
+    if not verified:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Face verification failed{f' (distance {distance:.3f})' if distance is not None else ''}. "
+                "Please face the camera and capture again."
+            ),
+        )
+
+    work_date = india_today()
+    existing = (
+        supabase.table("attendance")
+        .select("id,check_out_at,status")
+        .eq("employee_id", employee_id)
+        .eq("work_date", work_date)
+        .eq("status", "present")
+        .order("check_in_at", desc=True)
+        .limit(1)
+        .execute()
+    ).data or []
+    if existing and existing[0].get("check_out_at") is None:
+        raise HTTPException(status_code=409, detail="This employee is already checked in today.")
+    if existing and existing[0].get("check_out_at") is not None:
+        raise HTTPException(status_code=409, detail="This employee has already completed attendance today.")
+
+    photo_path = upload_attendance_photo(employee_id, "in", image_bytes)
+    now = datetime.now(timezone.utc).isoformat()
+    try:
+        rows = supabase_rest(
+            "POST",
+            "attendance",
+            payload={
+                "employee_id": employee_id,
+                "work_date": work_date,
+                "check_in_at": now,
+                "check_in_photo": photo_path,
+                "status": "present",
+            },
+        )
+        row = rows[0] if rows else {
+            "employee_id": employee_id,
+            "work_date": work_date,
+            "check_in_at": now,
+            "check_in_photo": photo_path,
+            "status": "present",
+        }
+    except Exception as exc:
+        print(f"[attendance] check-in database write failed: {type(exc).__name__}: {exc}")
+        raise HTTPException(status_code=502, detail="Attendance could not be recorded.") from exc
+    return {"ok": True, "attendance": row, "face_distance": distance}
+
+
+@app.post("/api/attendance/check-out")
+async def check_out(
+    employee_id: Annotated[str, Form()],
+    challenge_passed: Annotated[str, Form()],
+    image: Annotated[UploadFile, File()],
+    authorization: str | None = Header(default=None),
+):
+    if challenge_passed.lower() != "true":
+        raise HTTPException(status_code=422, detail="Complete the liveness check before capturing your attendance photo.")
+    enforce_rate_limit(f"out:{employee_id}")
+    image_bytes = await image.read()
+    profile_bytes = download_profile(employee_id)
+    verified, distance = verify_identity(profile_bytes, image_bytes)
+    if not verified:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Face verification failed{f' (distance {distance:.3f})' if distance is not None else ''}. "
+                "Please face the camera and capture again."
+            ),
+        )
+
+    work_date = india_today()
+    rows = (
+        supabase.table("attendance")
+        .select("*")
+        .eq("employee_id", employee_id)
+        .eq("work_date", work_date)
+        .eq("status", "present")
+        .is_("check_out_at", "null")
+        .order("check_in_at", desc=True)
+        .limit(1)
+        .execute()
+    ).data or []
+    if not rows:
+        raise HTTPException(status_code=409, detail="No open check-in was found for this employee today.")
+
+    photo_path = upload_attendance_photo(employee_id, "out", image_bytes)
+    now = datetime.now(timezone.utc).isoformat()
+    try:
+        row_list = supabase_rest(
+            "PATCH",
+            "attendance",
+            query=f"?id=eq.{rows[0]['id']}&check_out_at=is.null",
+            payload={"check_out_at": now, "check_out_photo": photo_path},
+        )
+        row = row_list[0] if row_list else {
+            "id": rows[0]["id"],
+            "employee_id": employee_id,
+            "check_out_at": now,
+            "check_out_photo": photo_path,
+        }
+    except Exception as exc:
+        print(f"[attendance] check-out database write failed: {type(exc).__name__}: {exc}")
+        raise HTTPException(status_code=502, detail="Check-out could not be recorded.") from exc
+    return {"ok": True, "attendance": row, "face_distance": distance}

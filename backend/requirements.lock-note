@@ -1,0 +1,1 @@
+DeepFace downloads its model weights on first use. Keep the API connected to the internet during first startup, or pre-cache the model files in the production image.
